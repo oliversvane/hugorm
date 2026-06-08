@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Hugorm — live transcript</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 2em auto; padding: 0 1em; }
+  #auth, #controls { margin-bottom: 1em; }
+  #auth input { width: 100%; font-family: monospace; font-size: 0.85em; padding: 0.4em; box-sizing: border-box; margin-top: 0.3em; }
+  #auth button { margin-top: 0.5em; padding: 0.4em 1em; }
+  #tenants { margin-top: 0.5em; }
+  #tenants select { padding: 0.3em; font-size: 0.95em; min-width: 15em; }
+  button { padding: 0.5em 1em; font-size: 1em; }
+  #status { margin-left: 1em; color: #666; }
+  #panes { display: flex; gap: 1em; align-items: flex-start; }
+  .pane { flex: 1; border: 1px solid #ddd; border-radius: 4px; padding: 1em; min-height: 12em; }
+  .pane h2 { margin: 0 0 0.5em 0; font-size: 1em; color: #555; }
+  #transcript { white-space: pre-wrap; line-height: 1.6; }
+  #refined { line-height: 1.6; }
+  .word { padding: 1px 2px; border-radius: 2px; }
+  .word.provisional { color: #888; }
+  .word.final { color: #111; }
+  .speaker-A { background: #e8f0fe; }
+  .speaker-B { background: #fef3e8; }
+  .speaker-C { background: #e8fbef; }
+  .speaker-D { background: #fbe8ef; }
+  .speaker-unknown { background: transparent; }
+  .turn { margin-bottom: 0.5em; }
+  .turn .sp { font-weight: 600; font-size: 0.8em; color: #555; margin-right: 0.3em; }
+  .entity-note { font-size: 0.75em; color: #888; margin-left: 0.5em; }
+  .err { color: #c22; }
+  #documents { margin-top: 1.5em; border-top: 1px solid #eee; padding-top: 1em; }
+  #documents h2 { margin: 0 0 0.5em 0; font-size: 1em; color: #555; }
+  #docList { font-size: 0.9em; }
+  #docList table { width: 100%; border-collapse: collapse; }
+  #docList td, #docList th { padding: 4px 8px; border-bottom: 1px solid #eee; text-align: left; }
+  .status-uploaded { color: #888; }
+  .status-processing { color: #b75; }
+  .status-processed { color: #2a7; }
+  .status-failed { color: #c22; }
+</style>
+</head>
+<body>
+<h1>Hugorm</h1>
+
+<div id="auth">
+  <label for="jwt">JWT (Supabase-signed or dev-bootstrap):</label>
+  <input id="jwt" type="text" placeholder="eyJ…" />
+  <button id="loadTenants">Load tenants</button>
+  <div id="tenants"></div>
+  <div id="authErr" class="err"></div>
+</div>
+
+<div id="controls">
+  <button id="start" disabled>Start</button>
+  <button id="stop" disabled>Stop</button>
+  <label for="lang" style="margin-left:1em">Language:</label>
+  <input id="lang" type="text" placeholder="auto" size="6" title="ISO code like 'da', 'en', or blank for auto-detect">
+  <label for="speakers" style="margin-left:1em">Speakers:</label>
+  <input id="speakers" type="number" min="1" max="8" placeholder="auto" style="width:5em" title="Exact speaker count (1 for solo); blank to auto-detect">
+  <span id="status">idle</span>
+</div>
+
+<div id="documents" hidden>
+  <h2>Documents (grounds refinement)</h2>
+  <input id="docFile" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" />
+  <button id="docUpload">Upload</button>
+  <button id="docRefresh">Refresh</button>
+  <span id="docStatus" style="margin-left:1em;color:#666"></span>
+  <div id="docList"></div>
+</div>
+
+<div id="panes">
+  <div class="pane">
+    <h2>Raw (live)</h2>
+    <div id="transcript"></div>
+  </div>
+  <div class="pane">
+    <h2>Refined (LLM + graph)</h2>
+    <div id="refined"></div>
+  </div>
+</div>
+
+<script>
+const jwtInput = document.getElementById("jwt");
+const loadBtn = document.getElementById("loadTenants");
+const tenantsDiv = document.getElementById("tenants");
+const authErr = document.getElementById("authErr");
+const startBtn = document.getElementById("start");
+const stopBtn = document.getElementById("stop");
+const statusEl = document.getElementById("status");
+const transcriptEl = document.getElementById("transcript");
+const refinedEl = document.getElementById("refined");
+
+let pc = null;
+let localStream = null;
+let words = new Map();
+let refinedTurns = [];
+let speakerPalette = new Map();
+let activeTenantId = null;
+
+function speakerClass(spk) {
+  if (!spk) return "speaker-unknown";
+  if (!speakerPalette.has(spk)) {
+    const letters = ["A", "B", "C", "D"];
+    speakerPalette.set(spk, letters[speakerPalette.size % letters.length]);
+  }
+  return "speaker-" + speakerPalette.get(spk);
+}
+
+function wordKey(w) { return w.start.toFixed(3) + ":" + w.end.toFixed(3); }
+
+function renderRaw() {
+  const sorted = [...words.values()].sort((a, b) => a.start - b.start);
+  transcriptEl.innerHTML = "";
+  for (const w of sorted) {
+    const span = document.createElement("span");
+    span.className = "word " + (w.final ? "final" : "provisional") + " " + speakerClass(w.speaker);
+    span.textContent = w.text + " ";
+    span.title = `${w.start.toFixed(2)}–${w.end.toFixed(2)}s` + (w.speaker ? ` · ${w.speaker}` : "");
+    transcriptEl.appendChild(span);
+  }
+}
+
+function renderRefined() {
+  refinedEl.innerHTML = "";
+  for (const t of refinedTurns) {
+    const div = document.createElement("div");
+    div.className = "turn " + speakerClass(t.speaker);
+    const sp = document.createElement("span");
+    sp.className = "sp";
+    sp.textContent = (t.speaker || "?") + ":";
+    div.appendChild(sp);
+    div.appendChild(document.createTextNode(t.text));
+    if (t.used_entity_ids && t.used_entity_ids.length) {
+      const note = document.createElement("span");
+      note.className = "entity-note";
+      note.textContent = " [" + t.used_entity_ids.join(", ") + "]";
+      div.appendChild(note);
+    }
+    refinedEl.appendChild(div);
+  }
+}
+
+function handleEvent(ev) {
+  if (ev.type === "session_started") {
+    statusEl.textContent = "session " + ev.session_id.slice(0, 8);
+  } else if (ev.type === "words_upserted") {
+    for (const k of [...words.keys()]) {
+      const w = words.get(k);
+      const mid = (w.start + w.end) / 2;
+      if (mid >= ev.window_start && mid < ev.window_end && !w.final) words.delete(k);
+    }
+    for (const w of ev.words) {
+      const existing = words.get(wordKey(w));
+      words.set(wordKey(w), {
+        start: w.start, end: w.end, text: w.text,
+        speaker: (existing && existing.speaker) || w.speaker || null,
+        final: existing ? existing.final : false,
+      });
+    }
+    renderRaw();
+  } else if (ev.type === "speakers_updated") {
+    for (const w of words.values()) {
+      const mid = (w.start + w.end) / 2;
+      for (const s of ev.segments) {
+        if (s.start <= mid && mid < s.end) { w.speaker = s.speaker; break; }
+      }
+    }
+    renderRaw();
+  } else if (ev.type === "segment_finalized") {
+    for (const w of words.values()) if (w.end <= ev.end) w.final = true;
+    renderRaw();
+  } else if (ev.type === "segment_refined") {
+    refinedTurns = refinedTurns.filter(t => t.end <= ev.start);
+    for (const t of ev.turns) refinedTurns.push(t);
+    refinedTurns.sort((a, b) => a.start - b.start);
+    renderRefined();
+  } else if (ev.type === "session_ended") {
+    statusEl.textContent = "ended";
+  }
+}
+
+async function loadTenants() {
+  authErr.textContent = "";
+  tenantsDiv.innerHTML = "";
+  const token = jwtInput.value.trim();
+  if (!token) { authErr.textContent = "paste a JWT first"; return; }
+  const resp = await fetch("/me/tenants", { headers: { Authorization: "Bearer " + token } });
+  if (!resp.ok) {
+    authErr.textContent = `load failed: ${resp.status} ${await resp.text()}`;
+    return;
+  }
+  const tenants = await resp.json();
+  if (!tenants.length) { authErr.textContent = "no tenants for this user"; return; }
+  const select = document.createElement("select");
+  select.id = "tenantSelect";
+  for (const t of tenants) {
+    const opt = document.createElement("option");
+    opt.value = t.id;
+    opt.textContent = `${t.name} (${t.role})`;
+    select.appendChild(opt);
+  }
+  tenantsDiv.appendChild(select);
+  activeTenantId = tenants[0].id;
+  select.onchange = () => { activeTenantId = select.value; refreshDocuments(); };
+  startBtn.disabled = false;
+  document.getElementById("documents").hidden = false;
+  refreshDocuments();
+}
+
+let docPollTimer = null;
+
+function schedulePoll() {
+  if (docPollTimer) return;
+  docPollTimer = setTimeout(() => {
+    docPollTimer = null;
+    refreshDocuments();
+  }, 2000);
+}
+
+async function refreshDocuments() {
+  if (!activeTenantId) return;
+  const token = jwtInput.value.trim();
+  const resp = await fetch("/documents?tenant=" + encodeURIComponent(activeTenantId), {
+    headers: { Authorization: "Bearer " + token },
+  });
+  if (!resp.ok) { return; }
+  const docs = await resp.json();
+  const list = document.getElementById("docList");
+  if (!docs.length) { list.innerHTML = "<em>No documents yet.</em>"; return; }
+  const rows = docs.map(d => `
+    <tr>
+      <td>${d.filename}</td>
+      <td>${(d.size_bytes / 1024).toFixed(1)} KB</td>
+      <td class="status-${d.status}">${d.status}${d.error ? ': ' + d.error : ''}</td>
+      <td>${d.created_at ? new Date(d.created_at).toLocaleString() : ''}</td>
+    </tr>`).join("");
+  list.innerHTML = `<table><thead><tr><th>File</th><th>Size</th><th>Status</th><th>Uploaded</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+  const pending = docs.some(d => d.status === "uploaded" || d.status === "processing");
+  if (pending) {
+    schedulePoll();
+  } else {
+    document.getElementById("docStatus").textContent = "";
+  }
+}
+
+async function uploadDocument() {
+  const fileInput = document.getElementById("docFile");
+  const docStatus = document.getElementById("docStatus");
+  const file = fileInput.files[0];
+  if (!file) { docStatus.textContent = "pick a file"; return; }
+  if (!activeTenantId) { docStatus.textContent = "select a tenant"; return; }
+  docStatus.textContent = "uploading…";
+  const fd = new FormData();
+  fd.append("file", file);
+  const resp = await fetch("/documents?tenant=" + encodeURIComponent(activeTenantId), {
+    method: "POST",
+    headers: { Authorization: "Bearer " + jwtInput.value.trim() },
+    body: fd,
+  });
+  if (!resp.ok) {
+    docStatus.textContent = "upload failed: " + resp.status + " " + await resp.text();
+    return;
+  }
+  docStatus.textContent = "uploaded — processing…";
+  fileInput.value = "";
+  refreshDocuments();
+}
+
+async function start() {
+  if (!activeTenantId) { authErr.textContent = "select a tenant first"; return; }
+  startBtn.disabled = true;
+  statusEl.textContent = "requesting mic…";
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+
+  pc = new RTCPeerConnection();
+  const dc = pc.createDataChannel("events");
+  dc.onmessage = (e) => {
+    try { handleEvent(JSON.parse(e.data)); } catch (err) { console.error(err, e.data); }
+  };
+  for (const track of localStream.getAudioTracks()) pc.addTrack(track, localStream);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  statusEl.textContent = "connecting…";
+  const lang = document.getElementById("lang").value.trim();
+  const speakers = document.getElementById("speakers").value.trim();
+  const params = new URLSearchParams({ tenant: activeTenantId });
+  if (lang) params.set("lang", lang);
+  if (speakers) params.set("speakers", speakers);
+  const url = "/offer?" + params.toString();
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + jwtInput.value.trim(),
+    },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+  });
+  if (!resp.ok) {
+    statusEl.textContent = "offer failed: " + resp.status;
+    authErr.textContent = await resp.text();
+    startBtn.disabled = false;
+    return;
+  }
+  const answer = await resp.json();
+  await pc.setRemoteDescription(answer);
+
+  statusEl.textContent = "listening";
+  stopBtn.disabled = false;
+}
+
+async function stop() {
+  stopBtn.disabled = true;
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  if (pc) { pc.close(); pc = null; }
+  statusEl.textContent = "stopped";
+  startBtn.disabled = false;
+}
+
+loadBtn.onclick = loadTenants;
+startBtn.onclick = start;
+stopBtn.onclick = stop;
+document.getElementById("docUpload").onclick = uploadDocument;
+document.getElementById("docRefresh").onclick = refreshDocuments;
+</script>
+</body>
+</html>
